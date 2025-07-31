@@ -1,0 +1,1414 @@
+import tkinter as tk
+from tkinter import ttk, simpledialog, messagebox
+import threading
+import time
+import ctypes
+import win32gui
+import win32api
+import win32con
+import json
+import os
+from pynput import keyboard
+import re
+
+# --- Global Constants ---
+VK_KEYS = {f"F{i}": 0x70 + i - 1 for i in range(1, 13)}  # Corrected F-key values
+VK_KEYS.update({
+    "F1": 0x70, "F2": 0x71, "F3": 0x72, "F4": 0x73, 
+    "F5": 0x74, "F6": 0x75, "F7": 0x76, "F8": 0x77, 
+    "F9": 0x78, "F10": 0x79, "F11": 0x7A, "F12": 0x7B
+})
+
+GLOBAL_CONFIG_FILE = "ftool_global_config.json"
+SHORTCUTS_CONFIG_FILE = "ftool_shortcuts_config.json"
+
+# Debug prefix
+DEBUG_PREFIX = "[MFFT]"
+SHORTCUT_PREFIX = "[MFFT Shortcut]"
+
+# Global variables
+all_ftools = []
+next_window_unique_id = 1
+all_shortcut_buttons = []
+next_shortcut_unique_id = 1
+main_canvas = None
+app_frame = None
+shortcuts_window = None
+theme_button = None
+refresh_all_button = None
+keyboard_listener = None
+active_hotkeys = {}
+style_manager_ref = None
+shortcuts_canvas = None
+shortcuts_inner_frame = None
+shortcuts_loaded = False
+
+# --- Enhanced Color Themes ---
+COLORS = {
+    "light": {
+        "bg": "#f8f9fa",
+        "fg": "#212529",
+        "frame_bg": "#e9ecef",
+        "label_fg": "#495057",
+        "entry_bg": "#ffffff",
+        "entry_fg": "#212529",
+        "combobox_bg": "#ffffff",
+        "combobox_fg": "#212529",
+        "status_fg_normal": "#0d6efd",
+        "status_fg_error": "#dc3545",
+        "status_fg_success": "#198754",
+        "status_fg_warning": "#ffc107",
+        "button_bg": "#e9ecef",
+        "button_fg": "#212529",
+        "add_button_bg": "#198754",
+        "add_button_fg": "#ffffff",
+        "delete_button_bg": "#dc3545",
+        "delete_button_fg": "#ffffff",
+        "shortcut_active_bg": "#0d6efd",
+        "shortcut_inactive_bg": "#6c757d",
+        "shortcut_executing_bg": "#0dcaf0",  # Added for executing state
+        "shortcut_fg": "#ffffff",
+        "scrollbar_trough_bg": "#dee2e6",
+        "scrollbar_slider_bg": "#adb5bd",
+        "indicator_active": "#198754",
+        "indicator_inactive": "#dc3545",
+        "border": "#ced4da",
+        "canvas_bg": "#e9ecef"
+    },
+    "dark": {
+        "bg": "#212529",
+        "fg": "#e9ecef",
+        "frame_bg": "#343a40",
+        "label_fg": "#dee2e6",
+        "entry_bg": "#495057",  # combobox background
+        "entry_fg": "#FFFFFF",  # combobox text
+        "combobox_bg": "#495057",  # combobox background
+        "combobox_fg": "#212529",  # combobox text
+        "status_fg_normal": "#4da6ff",
+        "status_fg_error": "#ff6b6b",
+        "status_fg_success": "#51cf66",
+        "status_fg_warning": "#ffd43b",
+        "button_bg": "#343a40",
+        "button_fg": "#f8f9fa",
+        "add_button_bg": "#2b8a3e",
+        "add_button_fg": "#ffffff",
+        "delete_button_bg": "#c92a2a",
+        "delete_button_fg": "#ffffff",
+        "shortcut_active_bg": "#339af0",
+        "shortcut_inactive_bg": "#868e96",
+        "shortcut_executing_bg": "#20c997",  # Added for executing state
+        "shortcut_fg": "#ffffff",
+        "scrollbar_trough_bg": "#495057",
+        "scrollbar_slider_bg": "#868e96",
+        "indicator_active": "#51cf66",
+        "indicator_inactive": "#ff6b6b",
+        "border": "#495057",
+        "canvas_bg": "#343a40"
+    }
+}
+
+# --- Debug Logging ---
+def debug_log(message):
+    print(f"{DEBUG_PREFIX} {message}")
+
+def shortcut_log(message):
+    print(f"{SHORTCUT_PREFIX} {message}")
+
+# --- Utility Functions ---
+def send_key(hwnd, vk_code):
+    if hwnd:
+        try:
+            debug_log(f"Sending key {vk_code} to window {hwnd}")
+            win32api.PostMessage(hwnd, win32con.WM_KEYDOWN, vk_code, 0)
+            time.sleep(0.01)
+            win32api.PostMessage(hwnd, win32con.WM_KEYUP, vk_code, 0)
+        except Exception as e:
+            debug_log(f"Error sending key {vk_code} to window {hwnd}: {e}")
+
+def get_window_titles():
+    titles = []
+    browser_names = ["Chrome", "Firefox", "Edge", "Opera", "Brave"]
+    flyff_pattern = re.compile(r"Flyff Universe", re.IGNORECASE)
+    
+    def enum_handler(hwnd, _):
+        if win32gui.IsWindowVisible(hwnd) and win32gui.GetParent(hwnd) == 0:
+            title = win32gui.GetWindowText(hwnd)
+            # Check if it's a browser window with Flyff
+            if any(browser in title for browser in browser_names) and flyff_pattern.search(title):
+                titles.append(title)
+            # Check for MoonFlyff specifically
+            elif "MoonFlyff - " in title:
+                titles.append(title)
+    win32gui.EnumWindows(enum_handler, None)
+    return titles
+
+def get_all_available_flyff_titles():
+    detected_titles = set(get_window_titles())
+    for ftool_instance in all_ftools:
+        if ftool_instance.window_var.get():
+            detected_titles.add(ftool_instance.window_var.get())
+    return sorted(list(detected_titles))
+
+def add_ftool_window(style_manager):
+    global next_window_unique_id
+    new_id = next_window_unique_id
+    ftool_instance = FToolWindow(app_frame, new_id, style_manager, is_new=True)
+    all_ftools.append(ftool_instance)
+    next_window_unique_id += 1
+    reposition_all_ftool_windows()
+
+def reposition_all_ftool_windows():
+    # Clear existing grid placements
+    for ft_window in all_ftools:
+        ft_window.frame.grid_forget()
+
+    # Dynamically calculate columns based on window count
+    num_windows = len(all_ftools)
+    MAX_COLUMNS = max(1, min(3, num_windows))  # Max 4 columns, min 1
+    
+    # Place windows in a grid
+    for i, ft_window in enumerate(all_ftools):
+        row = i // MAX_COLUMNS
+        col = i % MAX_COLUMNS
+        
+        ft_window.frame.grid(row=row, column=col, padx=10, pady=10, sticky="nsew")
+        ft_window.window_display_number = i + 1
+        ft_window.frame.config(text=f"Window {ft_window.window_display_number}")
+        ft_window.apply_theme()
+
+    # Configure columns
+    for c in range(MAX_COLUMNS):
+        app_frame.grid_columnconfigure(c, weight=1)
+    
+    app_frame.update_idletasks()
+    if main_canvas:
+        main_canvas.config(scrollregion=main_canvas.bbox("all"))
+
+def reposition_shortcut_buttons():
+    if not shortcuts_inner_frame:
+        return
+
+    for widget in shortcuts_inner_frame.winfo_children():
+        widget.grid_forget()
+
+    for i, btn_instance in enumerate(all_shortcut_buttons):
+        btn_instance.frame.grid(row=i, column=0, padx=5, pady=5, sticky="ew")
+        btn_instance.apply_theme(style_manager_ref)
+
+    shortcuts_inner_frame.update_idletasks()
+    if shortcuts_canvas:
+        shortcuts_canvas.config(scrollregion=shortcuts_canvas.bbox("all"))
+
+def on_canvas_configure(event):
+    if main_canvas and app_frame:
+        main_canvas.itemconfig(main_canvas.create_window((0, 0), window=app_frame, anchor="nw"), width=event.width)
+        main_canvas.config(scrollregion=main_canvas.bbox("all"))
+        reposition_all_ftool_windows()  # Add repositioning on resize
+
+def refresh_all_ftool_windows():
+    debug_log("Refreshing all Flyff windows")
+    for ft_window in all_ftools:
+        ft_window.refresh_windows()
+
+def on_closing(root, style_manager):
+    current_geometry = root.geometry()
+    style_manager.save_global_config(geometry=current_geometry)
+    
+    if shortcuts_window:
+        shortcuts_geometry = shortcuts_window.geometry()
+        style_manager.save_global_config(geometry=current_geometry, shortcuts_geometry=shortcuts_geometry)
+
+    debug_log("Closing application...")
+    for ft_window in all_ftools:
+        ft_window.save_config()
+        if ft_window.active:
+            ft_window.toggle(suppress_action=True)
+
+    save_shortcut_config()
+    for sb in all_shortcut_buttons:
+        if sb.active:
+            sb.toggle_active_state(suppress_action=True)
+    stop_keyboard_listener()
+
+    if shortcuts_window:
+        shortcuts_window.destroy()
+    root.destroy()
+
+def load_shortcut_config(parent_frame):
+    global next_shortcut_unique_id, shortcuts_loaded
+    if not os.path.exists(SHORTCUTS_CONFIG_FILE):
+        debug_log("No shortcuts config file found")
+        return
+
+    try:
+        with open(SHORTCUTS_CONFIG_FILE, 'r') as f:
+            config_data = json.load(f)
+
+        if not isinstance(config_data, list):
+            debug_log("Invalid shortcuts config format")
+            return
+
+        loaded_ids = []
+        for item in config_data:
+            unique_id = item.get("id")
+            if unique_id is not None:
+                loaded_ids.append(unique_id)
+                sb = ShortcutButton(parent_frame, style_manager_ref, unique_id, item)
+                all_shortcut_buttons.append(sb)
+                debug_log(f"Loaded shortcut: {sb.config['name']} (ID: {unique_id})")
+
+        if loaded_ids:
+            next_shortcut_unique_id = max(loaded_ids) + 1
+        debug_log(f"Next shortcut ID: {next_shortcut_unique_id}")
+        shortcuts_loaded = True
+    except (json.JSONDecodeError, Exception) as e:
+        debug_log(f"Error loading shortcuts: {e}")
+
+def save_shortcut_config():
+    config_data = []
+    for sb in all_shortcut_buttons:
+        config_data.append(sb.get_config())
+
+    try:
+        with open(SHORTCUTS_CONFIG_FILE, 'w') as f:
+            json.dump(config_data, f, indent=4)
+        debug_log("Shortcuts config saved")
+    except IOError as e:
+        debug_log(f"Error saving shortcuts: {e}")
+
+def start_keyboard_listener():
+    global keyboard_listener
+    if keyboard_listener is None or not keyboard_listener.is_alive():
+        debug_log("Starting keyboard listener")
+        keyboard_listener = keyboard.Listener(on_press=on_key_press, on_release=on_key_release)
+        keyboard_listener.daemon = True
+        keyboard_listener.start()
+
+def stop_keyboard_listener():
+    global keyboard_listener
+    if keyboard_listener and keyboard_listener.is_alive():
+        debug_log("Stopping keyboard listener")
+        keyboard_listener.stop()
+        keyboard_listener.join(timeout=1.0)
+
+pressed_keys = set()
+
+def on_key_press(key):
+    try:
+        key_name = None
+        if hasattr(key, 'name'):
+            key_name = key.name
+        elif hasattr(key, 'char') and key.char:
+            key_name = key.char.lower()
+        
+        if not key_name:
+            return
+
+        pressed_keys.add(key_name)
+
+        for hotkey_tuple, sb_instance in active_hotkeys.items():
+            modifier, main_key = hotkey_tuple
+            modifier_match = False
+
+            # Handle modifier keys
+            if modifier == 'ctrl':
+                if any(k in pressed_keys for k in ['ctrl', 'ctrl_l', 'ctrl_r']):
+                    modifier_match = True
+            elif modifier == 'alt':
+                if any(k in pressed_keys for k in ['alt', 'alt_l', 'alt_r']):
+                    modifier_match = True
+            elif modifier == 'shift':
+                if any(k in pressed_keys for k in ['shift', 'shift_l', 'shift_r']):
+                    modifier_match = True
+            elif modifier == 'none':
+                if not any(mod in pressed_keys for mod in ['ctrl', 'ctrl_l', 'ctrl_r', 'alt', 'alt_l', 'alt_r', 'shift', 'shift_l', 'shift_r']):
+                    modifier_match = True
+
+            if modifier_match and main_key == key_name:
+                if sb_instance.config["hotkey_active"]:
+                    # Toggle shortcut state
+                    sb_instance.toggle_active_state()
+    except Exception as e:
+        debug_log(f"Error in on_key_press: {e}")
+
+def on_key_release(key):
+    try:
+        key_name = None
+        if hasattr(key, 'name'):
+            key_name = key.name
+        elif hasattr(key, 'char') and key.char:
+            key_name = key.char.lower()
+        
+        if key_name in pressed_keys:
+            pressed_keys.remove(key_name)
+    except Exception as e:
+        debug_log(f"Error in on_key_release: {e}")
+
+# --- FToolWindow Class ---
+class FToolWindow:
+    def __init__(self, parent, window_unique_id, style_manager, is_new=False):
+        self.active = False
+        self.cached_hwnd = None
+        self.window_display_number = 0
+        self.id = window_unique_id
+        self.config_filename = f"ftool_config_win_id{self.id}.json"
+        self.style_manager = style_manager
+
+        # Create frame with consistent styling
+        self.frame = ttk.LabelFrame(parent, text=f"Window {self.window_display_number}", padding=(5, 2, 5, 5))
+        self.frame.grid_configure(padx=5, pady=5)
+        
+        action_buttons_frame = ttk.Frame(self.frame, padding=0)
+        action_buttons_frame.pack(pady=(0, 3), fill='x')  # reduced pady
+
+        self.start_button = ttk.Button(action_buttons_frame, text="Start", command=self.toggle, style="Green.TButton")
+        self.start_button.pack(side="left", padx=5)
+
+        self.delete_button = ttk.Button(action_buttons_frame, text="❌", command=self.delete_self, style="Delete.TButton")
+        self.delete_button.pack(side="right", padx=5)
+
+        # Add context menu
+        self.frame.bind("<Button-3>", self.show_context_menu)
+        self.start_button.bind("<Button-3>", self.show_context_menu)
+        self.delete_button.bind("<Button-3>", self.show_context_menu)
+
+        self.window_select_label = ttk.Label(self.frame, text="Select Flyff Window:", style="Themed.TLabel")
+        self.window_select_label.pack(pady=(0, 0))  # reduced pady
+
+        self.window_var = tk.StringVar()
+        self.window_menu = ttk.Combobox(self.frame, textvariable=self.window_var, width=30, state="readonly", style="Themed.TCombobox")
+        self.window_menu['values'] = get_window_titles()
+        self.window_menu.pack(pady=5)
+
+        self.status_label = ttk.Label(self.frame, text="", style="Status.TLabel")
+        self.status_label.pack(pady=(0, 3))  # reduced pady
+
+        self.entries = []
+        self.check_vars = []
+        self.indicator_canvases = []
+
+        # Create a frame for the F-key controls
+        keys_frame = ttk.Frame(self.frame, style="Themed.TFrame")
+        keys_frame.pack(fill="x", padx=5, pady=5)
+        
+        # Create a grid for indicators
+        grid_frame = ttk.Frame(keys_frame, style="Themed.TFrame")
+        grid_frame.pack(fill="both", expand=True)
+        
+        # Create 5 rows and 2 columns
+        for i in range(5):  # 5 rows
+            grid_frame.grid_rowconfigure(i, weight=1)
+        for j in range(2):  # 2 columns
+            grid_frame.grid_columnconfigure(j, weight=1)
+
+        # Optimized F-key layout
+        fkey_layout = [
+            ("F1", "F2"),  # Row 0
+            ("F3", "F4"),  # Row 1
+            ("F5", "F6"),  # Row 2
+            ("F7", "F8"),  # Row 3
+            ("F9", None)   # Row 4 (F9 centered)
+        ]
+
+        for row, keys in enumerate(fkey_layout):
+            for col, key in enumerate(keys):
+                if key is None:
+                    continue
+                    
+                frame = ttk.Frame(grid_frame, style="KeyRow.TFrame", padding=0)
+                
+                # Special handling for F9 to center it
+                if key == "F9":
+                    frame.grid(row=row, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
+                else:
+                    frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+                
+                ttk.Label(frame, text=key, style="Themed.TLabel", width=2).pack(side="left", padx=(2, 0))
+
+                delay_var = tk.StringVar(value="1")
+                entry = ttk.Entry(frame, textvariable=delay_var, width=4, style="Themed.TEntry")
+                entry.pack(side="left", padx=2, pady=0)
+
+                check_var = tk.BooleanVar(value=False)
+
+                canvas = tk.Canvas(frame, width=20, height=20, highlightthickness=0, 
+                                   bg=self.style_manager.get_current_color("canvas_bg"))
+                canvas.pack(side="left", padx=(0, 5))
+                canvas.bind("<Button-1>", lambda event, cv=canvas, var=check_var: self.toggle_indicator(cv, var))
+
+                self.entries.append((key, delay_var))
+                self.check_vars.append(check_var)
+                self.indicator_canvases.append(canvas)
+
+                self.draw_indicator(canvas, check_var.get())
+
+        if not is_new:
+            self.load_config()
+        self.update_all_indicators()
+        self.apply_theme()
+
+    def show_context_menu(self, event):
+        menu = tk.Menu(self.frame, tearoff=0)
+        menu.add_command(label="Delete", command=self.delete_self)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def draw_indicator(self, canvas, active_state):
+        canvas.delete("all")
+        colors = self.style_manager.get_current_theme_colors()
+        if active_state:
+            fill_color = colors["indicator_active"]
+            outline_color = colors["add_button_bg"]
+        else:
+            fill_color = colors["indicator_inactive"]
+            outline_color = colors["delete_button_bg"]
+            
+        # Draw circle with no background
+        canvas.create_oval(2, 2, 18, 18, fill=fill_color, outline=outline_color, width=1)
+
+    def toggle_indicator(self, canvas, check_var):
+        check_var.set(not check_var.get())
+        self.draw_indicator(canvas, check_var.get())
+
+    def update_all_indicators(self):
+        for i, check_var in enumerate(self.check_vars):
+            self.draw_indicator(self.indicator_canvases[i], check_var.get())
+
+    def refresh_windows(self):
+        detected_titles = get_window_titles()
+        self.window_menu['values'] = detected_titles
+
+        current_selection = self.window_var.get()
+        if current_selection and current_selection not in detected_titles:
+            self.window_var.set("")
+            self.status_label.config(text="Selected window no longer available.", foreground=self.style_manager.get_current_color("status_fg_warning"))
+            if self.active:
+                self.toggle(suppress_action=True)
+        elif not detected_titles:
+            self.status_label.config(text="No Flyff windows detected.", foreground=self.style_manager.get_current_color("status_fg_warning"))
+        else:
+            self.status_label.config(text="", foreground=self.style_manager.get_current_color("label_fg"))
+
+    def toggle(self, suppress_action=False):
+        if not suppress_action:
+            if not self.active:
+                selected_window_title = self.window_var.get()
+                if not selected_window_title:
+                    self.status_label.config(text="Please select a Flyff window.", foreground=self.style_manager.get_current_color("status_fg_warning"))
+                    return
+
+                self.cached_hwnd = win32gui.FindWindow(None, selected_window_title)
+                if not self.cached_hwnd:
+                    self.status_label.config(text=f"[Error] Window '{selected_window_title}' not found. Stopping.", foreground=self.style_manager.get_current_color("status_fg_error"))
+                    return
+
+                self.active = True
+                self.start_button.config(text="Stop", style="Red.TButton")
+                self.status_label.config(text="Key sending started.", foreground=self.style_manager.get_current_color("status_fg_success"))
+                debug_log(f"Starting FTool for window: {selected_window_title}")
+
+                self.thread = threading.Thread(target=self.loop)
+                self.thread.daemon = True
+                self.thread.start()
+            else:
+                self.active = False
+                self.start_button.config(text="Start", style="Green.TButton")
+                self.status_label.config(text="Key sending stopped.", foreground=self.style_manager.get_current_color("status_fg_normal"))
+                debug_log(f"Stopping FTool for window: {self.window_var.get()}")
+        
+        # Update status label color
+        status_text = self.status_label.cget("text")
+        if "Error" in status_text:
+            self.status_label.config(foreground=self.style_manager.get_current_color("status_fg_error"))
+        elif "started" in status_text:
+            self.status_label.config(foreground=self.style_manager.get_current_color("status_fg_success"))
+        elif "stopped" in status_text:
+            self.status_label.config(foreground=self.style_manager.get_current_color("status_fg_normal"))
+        elif "select" in status_text or "available" in status_text or "No Flyff" in status_text:
+            self.status_label.config(foreground=self.style_manager.get_current_color("status_fg_warning"))
+        else:
+            self.status_label.config(foreground=self.style_manager.get_current_color("label_fg"))
+
+    def loop(self):
+        selected_window_title = self.window_var.get()
+        debug_log(f"Starting loop for window: {selected_window_title}")
+        
+        while self.active:
+            # Refresh window handle if needed
+            if not self.cached_hwnd or not win32gui.IsWindow(self.cached_hwnd):
+                self.cached_hwnd = win32gui.FindWindow(None, selected_window_title)
+                if not self.cached_hwnd:
+                    self.status_label.config(text=f"[Error] Window '{selected_window_title}' lost. Stopping.", foreground=self.style_manager.get_current_color("status_fg_error"))
+                    self.active = False
+                    self.start_button.config(text="Start", style="Green.TButton")
+                    debug_log(f"Window lost: {selected_window_title}")
+                    break
+
+            for i, ((key, delay_var), check_var) in enumerate(zip(self.entries, self.check_vars)):
+                if not self.active:
+                    break
+                if check_var.get():
+                    try:
+                        delay = float(delay_var.get())
+                        if delay < 0:
+                            self.status_label.config(text=f"[Error] Positive delay required for {key}", foreground=self.style_manager.get_current_color("status_fg_error"))
+                            continue
+                        debug_log(f"Sending {key} to window {self.cached_hwnd} with delay {delay}")
+                        send_key(self.cached_hwnd, VK_KEYS[key])
+                        time.sleep(delay)
+                    except ValueError:
+                        self.status_label.config(text=f"[Error] Invalid interval for {key}. Must be a number.", foreground=self.style_manager.get_current_color("status_fg_error"))
+                    except Exception as e:
+                        self.status_label.config(text=f"[Error] Error for {key}: {e}", foreground=self.style_manager.get_current_color("status_fg_error"))
+            
+            time.sleep(0.05)  # Small delay to prevent high CPU usage
+
+    def save_config(self):
+        config_data = {
+            "window_title": self.window_var.get(),
+            "keys_config": []
+        }
+        for (key_name, delay_var), check_var in zip(self.entries, self.check_vars):
+            config_data["keys_config"].append({
+                "key": key_name,
+                "delay": delay_var.get(),
+                "checked": check_var.get()
+            })
+
+        try:
+            with open(self.config_filename, 'w') as f:
+                json.dump(config_data, f, indent=4)
+            debug_log(f"Saved config for window ID {self.id}")
+        except IOError as e:
+            debug_log(f"Error saving config for window ID {self.id}: {e}")
+
+    def load_config(self):
+        if not os.path.exists(self.config_filename):
+            debug_log(f"No config file found for window ID {self.id}")
+            return
+
+        try:
+            with open(self.config_filename, 'r') as f:
+                config_data = json.load(f)
+
+            self.window_var.set(config_data.get("window_title", ""))
+            debug_log(f"Loaded window title: {self.window_var.get()} for ID {self.id}")
+
+            for (_, delay_var), check_var in zip(self.entries, self.check_vars):
+                delay_var.set("1")
+                check_var.set(False)
+
+            for item in config_data.get("keys_config", []):
+                key_name = item.get("key")
+                delay = item.get("delay")
+                checked = item.get("checked")
+
+                for i, (entry_key, delay_var) in enumerate(self.entries):
+                    if entry_key == key_name:
+                        delay_var.set(str(delay))
+                        self.check_vars[i].set(checked)
+                        debug_log(f"Loaded key config: {key_name} - delay: {delay} - active: {checked}")
+                        break
+        except (json.JSONDecodeError, Exception) as e:
+            debug_log(f"Error loading config for window ID {self.id}: {e}")
+
+    def delete_self(self):
+        if self.active:
+            self.toggle(suppress_action=True)
+
+        self.save_config()
+        if os.path.exists(self.config_filename):
+            try:
+                os.remove(self.config_filename)
+                debug_log(f"Deleted config file for window ID {self.id}")
+            except Exception as e:
+                debug_log(f"Error deleting config file {self.config_filename}: {e}")
+
+        global all_ftools
+        all_ftools = [ft for ft in all_ftools if ft.id != self.id]
+        debug_log(f"Deleted window ID {self.id}")
+
+        self.frame.destroy()
+        reposition_all_ftool_windows()
+
+    def apply_theme(self):
+        if not self.frame.winfo_exists():
+            return
+            
+        current_colors = self.style_manager.get_current_theme_colors()
+
+        self.frame.config(text=f"Window {self.window_display_number}")
+        self.frame.config(style=f"{self.style_manager.current_theme}.TLabelframe")
+
+        self.window_select_label.config(foreground=current_colors["label_fg"])
+        self.toggle(suppress_action=True)
+
+        self.window_menu.config(style="Themed.TCombobox")
+        self.status_label.config(background=current_colors["frame_bg"])
+
+        # Apply theme to child widgets
+        for widget in self.frame.winfo_children():
+            if isinstance(widget, ttk.Frame):
+                widget.config(style=f"{self.style_manager.current_theme}.TFrame")
+                for sub_widget in widget.winfo_children():
+                    if isinstance(sub_widget, (ttk.Label, ttk.Entry, tk.Canvas)):
+                        if isinstance(sub_widget, tk.Canvas):
+                            sub_widget.config(bg=current_colors["canvas_bg"])
+                            self.update_all_indicators()
+
+# --- ShortcutButton Class ---
+class ShortcutButton:
+    def __init__(self, parent_frame, style_manager, unique_id, config_data=None):
+        self.id = unique_id
+        self.active = False
+        self.executing = False
+        self.style_manager = style_manager
+        
+        # Default configuration
+        self.config = {
+            "name": f"Shortcut {unique_id}",
+            "keys_to_spam": ["F1"],
+            "target_windows": [],
+            "delay": 0.1,
+            "modifier_key": "none",
+            "main_hotkey": "q",
+            "hotkey_active": True
+        }
+        
+        # Update with saved config if available
+        if config_data:
+            self.config.update(config_data)
+
+        # Create frame for the entire shortcut
+        self.frame = ttk.Frame(parent_frame, style="Themed.TFrame")
+        self.frame.grid(padx=5, pady=5, sticky="ew")
+        
+        # Create button
+        self.button = ttk.Button(self.frame, text=self._get_button_text(), 
+                               command=self.toggle_active_state)
+        self.button.pack(fill="x", expand=True, pady=(0, 5))
+        self.button.bind("<Button-3>", self.show_context_menu)
+        
+        # Create info frame
+        self.info_frame = ttk.Frame(self.frame, style="Themed.TFrame")
+        self.info_frame.pack(fill="x", expand=True)
+        
+        # Active keys label
+        self.keys_label = ttk.Label(self.info_frame, text="", style="Themed.TLabel")
+        self.keys_label.pack(side="left", padx=(10, 5), pady=2, anchor="w")
+        
+        # Delay label
+        self.delay_label = ttk.Label(self.info_frame, text="", style="Themed.TLabel")
+        self.delay_label.pack(side="right", padx=(5, 10), pady=2, anchor="e")
+        
+        # Update labels
+        self.update_info_labels()
+        self.apply_theme(self.style_manager)
+        self.update_global_hotkey()
+
+    def _get_button_text(self):
+        return f"{self.config['name']} ({self.config['modifier_key']}+{self.config['main_hotkey']})"
+
+    def update_info_labels(self):
+        active_keys = ", ".join(self.config["keys_to_spam"])
+        self.keys_label.config(text=f"Keys: {active_keys}")
+        self.delay_label.config(text=f"Delay: {self.config['delay']}s")
+
+    def toggle_active_state(self, suppress_action=False):
+        if not suppress_action:
+            self.active = not self.active
+            if self.active:
+                self.spam_thread = threading.Thread(target=self._spam_loop, daemon=True)
+                self.spam_thread.start()
+                shortcut_log(f"Shortcut '{self.config['name']}' activated (Keys: {', '.join(self.config['keys_to_spam'])}, Delay: {self.config['delay']}s)")
+            else:
+                self.spam_thread = None
+                shortcut_log(f"Shortcut '{self.config['name']}' deactivated")
+        self.apply_theme(self.style_manager)
+
+    def _spam_loop(self):
+        shortcut_log(f"Spam loop started for '{self.config['name']}'")
+        while self.active:
+            for title in self.config["target_windows"]:
+                if not self.active:
+                    break
+                hwnd = win32gui.FindWindow(None, title)
+                if hwnd and win32gui.IsWindowVisible(hwnd):
+                    for key_name in self.config["keys_to_spam"]:
+                        key_code = VK_KEYS.get(key_name)
+                        if not key_code:
+                            continue
+                        try:
+                            send_key(hwnd, key_code)
+                            time.sleep(0.05)
+                        except Exception as e:
+                            debug_log(f"Error sending key for '{self.config['name']}': {e}")
+                time.sleep(self.config["delay"])
+        shortcut_log(f"Spam loop stopped for '{self.config['name']}'")
+
+    def execute_shortcut_action(self):
+        if not self.config["hotkey_active"]:
+            return
+
+        # Set executing state and update UI
+        self.executing = True
+        self.apply_theme(self.style_manager)
+        shortcut_log(f"Executing shortcut action for '{self.config['name']}' (Keys: {', '.join(self.config['keys_to_spam'])}, Delay: {self.config['delay']}s)")
+        
+        for title in self.config["target_windows"]:
+            hwnd = win32gui.FindWindow(None, title)
+            if hwnd and win32gui.IsWindowVisible(hwnd):
+                for key_name in self.config["keys_to_spam"]:
+                    key_code = VK_KEYS.get(key_name)
+                    if not key_code:
+                        continue
+                    try:
+                        send_key(hwnd, key_code)
+                        time.sleep(0.05)
+                    except Exception as e:
+                        debug_log(f"Error sending key via hotkey for '{self.config['name']}': {e}")
+        
+        # Reset executing state after a short delay
+        time.sleep(0.2)
+        self.executing = False
+        self.apply_theme(self.style_manager)
+
+    def show_context_menu(self, event):
+        menu = tk.Menu(self.button, tearoff=0)
+        menu.add_command(label="Reconfigure", command=self.reconfigure_shortcut)
+        menu.add_command(label="Delete", command=self.delete_self)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def reconfigure_shortcut(self):
+        dialog = ShortcutConfigDialog(self.button.winfo_toplevel(), self.style_manager, self)
+        if dialog.result:
+            old_hotkey = (self.config["modifier_key"], self.config["main_hotkey"])
+            self.config.update(dialog.result)
+            self.button.config(text=self._get_button_text())
+            self.update_info_labels()
+            self.apply_theme(self.style_manager)
+            self.update_global_hotkey(old_hotkey)
+
+            if self.active:
+                self.toggle_active_state(suppress_action=True)
+                self.toggle_active_state()
+
+            save_shortcut_config()
+            debug_log(f"Reconfigured shortcut: {self.config['name']}")
+
+    def delete_self(self):
+        if self.active:
+            self.toggle_active_state(suppress_action=True)
+
+        self.unregister_global_hotkey()
+
+        global all_shortcut_buttons
+        all_shortcut_buttons = [sb for sb in all_shortcut_buttons if sb.id != self.id]
+        self.frame.destroy()
+        reposition_shortcut_buttons()
+        save_shortcut_config()
+        shortcut_log(f"Deleted shortcut: {self.config['name']}")
+
+    def get_config(self):
+        return self.config.copy()
+
+    def apply_theme(self, style_manager):
+        if self.executing:
+            self.button.config(style="ShortcutExecuting.TButton")
+        elif self.active:
+            self.button.config(style="ShortcutActive.TButton")
+        else:
+            self.button.config(style="ShortcutInactive.TButton")
+            
+        # Update label colors
+        current_colors = style_manager.get_current_theme_colors()
+        self.keys_label.config(foreground=current_colors["label_fg"])
+        self.delay_label.config(foreground=current_colors["label_fg"])
+
+    def update_global_hotkey(self, old_hotkey=None):
+        # Unregister old hotkey if exists
+        if old_hotkey and old_hotkey in active_hotkeys and active_hotkeys[old_hotkey] == self:
+            del active_hotkeys[old_hotkey]
+            debug_log(f"Unregistered old hotkey for '{self.config['name']}': {old_hotkey}")
+
+        # Only register if hotkey is active
+        if self.config["hotkey_active"]:
+            modifier_key = self.config["modifier_key"]
+            main_hotkey = self.config["main_hotkey"]
+            hotkey_tuple = (modifier_key, main_hotkey)
+
+            # Check for conflicts
+            for existing_hotkey, existing_sb_instance in active_hotkeys.items():
+                if hotkey_tuple == existing_hotkey and existing_sb_instance != self:
+                    messagebox.showwarning("Hotkey Conflict",
+                                          f"The hotkey {modifier_key}+{main_hotkey.upper()} is already used by '{existing_sb_instance.config['name']}'.",
+                                          parent=root_main_app)
+                    debug_log(f"Hotkey conflict: {modifier_key}+{main_hotkey} already in use")
+                    self.config["hotkey_active"] = False
+                    return
+
+            active_hotkeys[hotkey_tuple] = self
+            debug_log(f"Registered hotkey for '{self.config['name']}': {modifier_key}+{main_hotkey}")
+        else:
+            debug_log(f"Hotkey inactive for '{self.config['name']}', not registered")
+
+    def unregister_global_hotkey(self):
+        current_hotkey_tuple = (self.config["modifier_key"], self.config["main_hotkey"])
+        if current_hotkey_tuple in active_hotkeys and active_hotkeys[current_hotkey_tuple] == self:
+            del active_hotkeys[current_hotkey_tuple]
+            debug_log(f"Unregistered hotkey for '{self.config['name']}': {current_hotkey_tuple}")
+
+# --- ShortcutConfigDialog Class ---
+class ShortcutConfigDialog(simpledialog.Dialog):
+    def __init__(self, parent, style_manager, shortcut_button_instance=None):
+        self.style_manager = style_manager
+        self.shortcut_button_instance = shortcut_button_instance
+        self.initial_config = shortcut_button_instance.get_config() if shortcut_button_instance else {
+            "name": "", "keys_to_spam": ["F1"], "target_windows": [], "delay": 0.1, 
+            "modifier_key": "none", "main_hotkey": "q", "hotkey_active": True
+        }
+        super().__init__(parent, "Configure Shortcut")
+
+    def body(self, master):
+        self.resizable(False, False)
+        current_colors = self.style_manager.get_current_theme_colors()
+        master.config(bg=current_colors["bg"])
+
+        # Shortcut name
+        ttk.Label(master, text="Shortcut Name:", style="Dialog.TLabel").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.name_var = tk.StringVar(value=self.initial_config["name"])
+        self.name_entry = ttk.Entry(master, textvariable=self.name_var, width=30, style="Themed.TEntry")
+        self.name_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+
+        # Keys to spam
+        ttk.Label(master, text="Keys to Spam:", style="Dialog.TLabel").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        keys_frame = ttk.Frame(master, style="Themed.TFrame")
+        keys_frame.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        
+        self.keys_vars = {}
+        for i in range(1, 10):
+            key = f"F{i}"
+            var = tk.BooleanVar(value=key in self.initial_config["keys_to_spam"])
+            self.keys_vars[key] = var
+            chk = ttk.Checkbutton(keys_frame, text=key, variable=var, style="Dialog.TCheckbutton")
+            chk.grid(row=0, column=i-1, padx=2)
+
+        # Delay
+        ttk.Label(master, text="Delay (seconds):", style="Dialog.TLabel").grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        self.delay_var = tk.StringVar(value=str(self.initial_config["delay"]))
+        self.delay_entry = ttk.Entry(master, textvariable=self.delay_var, width=10, style="Themed.TEntry")
+        self.delay_entry.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
+
+        # Hotkey activation
+        ttk.Label(master, text="Hotkey Active:", style="Dialog.TLabel").grid(row=3, column=0, padx=5, pady=5, sticky="w")
+        self.hotkey_active_var = tk.BooleanVar(value=self.initial_config["hotkey_active"])
+        self.hotkey_active_check = ttk.Checkbutton(master, variable=self.hotkey_active_var, style="Dialog.TCheckbutton")
+        self.hotkey_active_check.grid(row=3, column=1, padx=5, pady=5, sticky="w")
+
+        # Target windows
+        ttk.Label(master, text="Target Flyff Windows:", style="Dialog.TLabel").grid(row=4, column=0, columnspan=2, padx=5, pady=5, sticky="w")
+        self.target_windows_frame = ttk.Frame(master, style="Themed.TFrame")
+        self.target_windows_frame.grid(row=5, column=0, columnspan=2, padx=5, pady=5, sticky="nsew")
+
+        self.target_window_vars = {}
+        detected_titles = get_all_available_flyff_titles()
+        initial_targets = set(self.initial_config["target_windows"])
+
+        if not detected_titles:
+            ttk.Label(self.target_windows_frame, text="No Flyff windows detected.", style="Dialog.TLabel").pack(padx=5, pady=5)
+        else:
+            canvas_targets = tk.Canvas(self.target_windows_frame, height=100, bg=current_colors["frame_bg"], highlightbackground=current_colors["frame_bg"])
+            canvas_targets.pack(side="left", fill="both", expand=True)
+            scrollbar_targets = ttk.Scrollbar(self.target_windows_frame, orient="vertical", command=canvas_targets.yview, style="Vertical.TScrollbar")
+            scrollbar_targets.pack(side="right", fill="y")
+            canvas_targets.configure(yscrollcommand=scrollbar_targets.set)
+
+            inner_frame_targets = ttk.Frame(canvas_targets, style=f"{self.style_manager.current_theme}.TFrame")
+            canvas_targets.create_window((0, 0), window=inner_frame_targets, anchor="nw")
+
+            for title in detected_titles:
+                var = tk.BooleanVar(value=title in initial_targets)
+                chk = ttk.Checkbutton(inner_frame_targets, text=title, variable=var, style="Dialog.TCheckbutton")
+                chk.pack(anchor="w", padx=2, pady=1)
+                self.target_window_vars[title] = var
+
+            inner_frame_targets.update_idletasks()
+            canvas_targets.config(scrollregion=canvas_targets.bbox("all"))
+            canvas_targets.bind('<Configure>', lambda e, c=canvas_targets: c.itemconfig(1, width=e.width))
+
+        # Global hotkey
+        ttk.Label(master, text="Global Hotkey:", style="Dialog.TLabel").grid(row=6, column=0, padx=5, pady=5, sticky="w")
+        hotkey_frame = ttk.Frame(master, style="Themed.TFrame")
+        hotkey_frame.grid(row=6, column=1, padx=5, pady=5, sticky="ew")
+
+        self.modifier_var = tk.StringVar(value=self.initial_config["modifier_key"])
+        self.modifier_menu = ttk.Combobox(hotkey_frame, textvariable=self.modifier_var, values=["none", "ctrl", "alt", "shift"], state="readonly", width=8, style="Themed.TCombobox")
+        self.modifier_menu.pack(side="left", padx=2)
+
+        ttk.Label(hotkey_frame, text="+", style="Dialog.TLabel").pack(side="left", padx=2)
+
+        self.main_hotkey_var = tk.StringVar(value=self.initial_config["main_hotkey"])
+        self.main_hotkey_entry = ttk.Entry(hotkey_frame, textvariable=self.main_hotkey_var, width=5, style="Themed.TEntry")
+        self.main_hotkey_entry.pack(side="left", padx=2)
+        self.main_hotkey_entry.bind("<Key>", self.validate_single_character)
+        self.main_hotkey_entry.bind("<FocusOut>", lambda e: self.normalize_hotkey_entry())
+
+        self.apply_dialog_theme()
+        return self.name_entry
+
+    def validate_single_character(self, event):
+        if event.keysym in ('BackSpace', 'Delete', 'Left', 'Right'):
+            return
+        current_value = self.main_hotkey_var.get()
+        if event.char and event.char.isalnum():
+            self.main_hotkey_var.set(event.char.lower())
+        return "break"
+
+    def normalize_hotkey_entry(self):
+        current_value = self.main_hotkey_var.get().strip().lower()
+        if len(current_value) > 1:
+            self.main_hotkey_var.set(current_value[0])
+        elif len(current_value) == 0:
+            self.main_hotkey_var.set("q")
+
+    def apply_dialog_theme(self):
+        current_colors = self.style_manager.get_current_theme_colors()
+        self.master.config(bg=current_colors["bg"])
+        self.style_manager.style.configure("Dialog.TLabel",
+                                          background=current_colors["bg"],
+                                          foreground=current_colors["label_fg"])
+
+    def buttonbox(self):
+        box = ttk.Frame(self, style=f"{self.style_manager.current_theme}.TFrame")
+        w = ttk.Button(box, text="OK", width=10, command=self.ok, default="active", style="Add.TButton")
+        w.pack(side="left", padx=5, pady=5)
+        w = ttk.Button(box, text="Cancel", width=10, command=self.cancel, style="Delete.TButton")
+        w.pack(side="left", padx=5, pady=5)
+        self.bind("<Return>", self.ok)
+        self.bind("<Escape>", self.cancel)
+        box.pack()
+        self.style_manager.apply_base_styles()
+
+    def ok(self):
+        try:
+            delay = float(self.delay_var.get())
+            if delay < 0:
+                messagebox.showerror("Validation Error", "Delay must be a positive number.", parent=self)
+                return
+        except ValueError:
+            messagebox.showerror("Validation Error", "Delay must be a valid number.", parent=self)
+            return
+
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showerror("Validation Error", "Shortcut name cannot be empty.", parent=self)
+            return
+
+        main_hotkey = self.main_hotkey_var.get().strip().lower()
+        if not main_hotkey or len(main_hotkey) != 1:
+            messagebox.showerror("Validation Error", "Main hotkey must be a single character.", parent=self)
+            return
+
+        selected_keys = [key for key, var in self.keys_vars.items() if var.get()]
+        if not selected_keys:
+            messagebox.showwarning("Warning", "No keys selected for spamming.", parent=self)
+
+        selected_windows = [title for title, var in self.target_window_vars.items() if var.get()]
+
+        self.result = {
+            "name": name,
+            "keys_to_spam": selected_keys,
+            "target_windows": selected_windows,
+            "delay": delay,
+            "modifier_key": self.modifier_var.get(),
+            "main_hotkey": main_hotkey,
+            "hotkey_active": self.hotkey_active_var.get()
+        }
+        super().ok()
+
+# --- ThemeManager Class ---
+class ThemeManager:
+    def __init__(self, root_window, all_ftools_list, all_shortcut_buttons_list):
+        self.root = root_window
+        self.all_ftools = all_ftools_list
+        self.all_shortcut_buttons = all_shortcut_buttons_list
+        self.style = ttk.Style()
+        self.current_theme = "light"
+        self.theme_button_ref = None
+        self.refresh_button_ref = None
+        self.shortcuts_geometry = None
+
+        self.load_global_config()
+        self.apply_base_styles()
+
+    def set_theme_button(self, button):
+        self.theme_button_ref = button
+        self.update_theme_button_text()
+
+    def set_refresh_button(self, button):
+        self.refresh_button_ref = button
+
+    def update_theme_button_text(self):
+        if self.theme_button_ref:
+            self.theme_button_ref.config(text="🌙" if self.current_theme == "light" else "☀️")
+
+    def load_global_config(self):
+        if os.path.exists(GLOBAL_CONFIG_FILE):
+            try:
+                with open(GLOBAL_CONFIG_FILE, 'r') as f:
+                    config = json.load(f)
+                    self.current_theme = config.get("theme", "light")
+                    self.window_geometry = config.get("geometry")
+                    self.shortcuts_geometry = config.get("shortcuts_geometry")
+                debug_log(f"Loaded global config: theme={self.current_theme}")
+            except (json.JSONDecodeError, IOError):
+                self.current_theme = "light"
+                self.window_geometry = None
+                self.shortcuts_geometry = None
+                debug_log("Error loading global config, using defaults")
+        else:
+            self.current_theme = "light"
+            self.window_geometry = None
+            self.shortcuts_geometry = None
+            debug_log("No global config found, using defaults")
+
+    def save_global_config(self, geometry=None, shortcuts_geometry=None):
+        config = {"theme": self.current_theme}
+        if geometry:
+            config["geometry"] = geometry
+        if shortcuts_geometry:
+            config["shortcuts_geometry"] = shortcuts_geometry
+        try:
+            with open(GLOBAL_CONFIG_FILE, 'w') as f:
+                json.dump(config, f, indent=4)
+            debug_log("Saved global config")
+        except IOError as e:
+            debug_log(f"Error saving global config: {e}")
+
+    def get_current_theme_colors(self):
+        return COLORS[self.current_theme]
+
+    def get_current_color(self, key):
+        return self.get_current_theme_colors().get(key, "black" if self.current_theme == "light" else "white")
+
+    def apply_base_styles(self):
+        current_colors = self.get_current_theme_colors()
+        self.style.theme_use('default')
+
+        # Configure base styles
+        self.style.configure(".", 
+                             background=current_colors["bg"],
+                             foreground=current_colors["fg"],
+                             font=("Segoe UI", 9))
+        
+        # Configure specific styles
+        self.style.configure("TFrame", background=current_colors["frame_bg"])
+        self.style.configure("TLabelframe", background=current_colors["frame_bg"], 
+                            foreground=current_colors["label_fg"], 
+                            relief="solid", 
+                            borderwidth=1)
+        self.style.configure("TLabelframe.Label", background=current_colors["frame_bg"], 
+                            foreground=current_colors["label_fg"])
+        
+        self.style.configure("TLabel", background=current_colors["frame_bg"], 
+                            foreground=current_colors["label_fg"])
+        
+        self.style.configure("TEntry", fieldbackground=current_colors["entry_bg"], 
+                            foreground=current_colors["entry_fg"], 
+                            insertcolor=current_colors["entry_fg"], 
+                            bordercolor=current_colors["border"], 
+                            lightcolor=current_colors["border"], 
+                            darkcolor=current_colors["border"])
+        
+        self.style.configure("TCombobox", fieldbackground=current_colors["combobox_bg"], 
+                            foreground=current_colors["combobox_fg"], 
+                            selectbackground=current_colors["add_button_bg"], 
+                            selectforeground=current_colors["add_button_fg"], 
+                            bordercolor=current_colors["border"], 
+                            lightcolor=current_colors["border"], 
+                            darkcolor=current_colors["border"])
+        
+        self.style.configure("Vertical.TScrollbar", 
+                            troughcolor=current_colors["scrollbar_trough_bg"], 
+                            background=current_colors["scrollbar_slider_bg"])
+        self.style.map("Vertical.TScrollbar", 
+                      background=[('active', current_colors["scrollbar_slider_bg"])])
+        
+        # Status label style
+        self.style.configure("Status.TLabel", background=current_colors["frame_bg"])
+        
+        # Button styles
+        self.style.configure("Green.TButton", 
+                            foreground=current_colors["button_fg"], 
+                            background=current_colors["add_button_bg"])
+        self.style.map("Green.TButton", 
+                      foreground=[('active', current_colors["button_fg"]), ('pressed', current_colors["button_fg"])],
+                      background=[('active', current_colors["add_button_bg"]), ('pressed', current_colors["add_button_bg"])])
+        
+        self.style.configure("Red.TButton", 
+                            foreground=current_colors["button_fg"], 
+                            background=current_colors["delete_button_bg"])
+        self.style.map("Red.TButton", 
+                      foreground=[('active', current_colors["button_fg"]), ('pressed', current_colors["button_fg"])],
+                      background=[('active', current_colors["delete_button_bg"]), ('pressed', current_colors["delete_button_bg"])])
+        
+        self.style.configure("Add.TButton", 
+                            foreground=current_colors["add_button_fg"], 
+                            background=current_colors["add_button_bg"])
+        self.style.map("Add.TButton", 
+                      foreground=[('active', current_colors["add_button_fg"]), ('pressed', current_colors["add_button_fg"])],
+                      background=[('active', current_colors["add_button_bg"]), ('pressed', current_colors["add_button_bg"])])
+        
+        self.style.configure("Delete.TButton", 
+                            foreground=current_colors["delete_button_fg"], 
+                            background=current_colors["delete_button_bg"])
+        self.style.map("Delete.TButton", 
+                      foreground=[('active', current_colors["delete_button_fg"]), ('pressed', current_colors["delete_button_fg"])],
+                      background=[('active', current_colors["delete_button_bg"]), ('pressed', current_colors["delete_button_bg"])])
+        
+        self.style.configure("Themed.TButton", 
+                            foreground=current_colors["button_fg"], 
+                            background=current_colors["button_bg"])
+        self.style.map("Themed.TButton", 
+                      foreground=[('active', current_colors["button_fg"]), ('pressed', current_colors["button_fg"])],
+                      background=[('active', current_colors["button_bg"]), ('pressed', current_colors["button_bg"])])
+        
+        self.style.configure("ShortcutActive.TButton", 
+                            foreground=current_colors["shortcut_fg"], 
+                            background=current_colors["shortcut_active_bg"])
+        self.style.map("ShortcutActive.TButton", 
+                      foreground=[('active', current_colors["shortcut_fg"]), ('pressed', current_colors["shortcut_fg"])],
+                      background=[('active', current_colors["shortcut_active_bg"]), ('pressed', current_colors["shortcut_active_bg"])])
+        
+        self.style.configure("ShortcutInactive.TButton", 
+                            foreground=current_colors["shortcut_fg"], 
+                            background=current_colors["shortcut_inactive_bg"])
+        self.style.map("ShortcutInactive.TButton", 
+                      foreground=[('active', current_colors["shortcut_fg"]), ('pressed', current_colors["shortcut_fg"])],
+                      background=[('active', current_colors["shortcut_inactive_bg"]), ('pressed', current_colors["shortcut_inactive_bg"])])
+        
+        self.style.configure("ShortcutExecuting.TButton", 
+                            foreground=current_colors["shortcut_fg"], 
+                            background=current_colors["shortcut_executing_bg"])
+        self.style.map("ShortcutExecuting.TButton", 
+                      foreground=[('active', current_colors["shortcut_fg"]), ('pressed', current_colors["shortcut_fg"])],
+                      background=[('active', current_colors["shortcut_executing_bg"]), ('pressed', current_colors["shortcut_executing_bg"])])
+        
+        # Checkbutton style
+        self.style.configure("Dialog.TCheckbutton", 
+                            background=current_colors["frame_bg"], 
+                            foreground=current_colors["label_fg"])
+        self.style.map("Dialog.TCheckbutton", 
+                      background=[('active', current_colors["frame_bg"]), ('selected', current_colors["frame_bg"])],
+                      foreground=[('active', current_colors["label_fg"]), ('selected', current_colors["label_fg"])])
+
+    def apply_theme_to_all_widgets(self):
+        current_colors = self.get_current_theme_colors()
+        self.root.config(bg=current_colors["bg"])
+        
+        if main_canvas:
+            main_canvas.config(bg=current_colors["bg"], highlightbackground=current_colors["bg"])
+        
+        if app_frame:
+            app_frame.config(style="TFrame")
+        
+        if shortcuts_window:
+            shortcuts_window.config(bg=current_colors["bg"])
+        
+        self.apply_base_styles()
+        
+        if self.refresh_button_ref:
+            self.refresh_button_ref.config(style="Themed.TButton")
+        if self.theme_button_ref:
+            self.theme_button_ref.config(style="Themed.TButton")
+            self.update_theme_button_text()
+
+        self.root.option_add('*TCombobox*Listbox.background', current_colors["combobox_bg"])
+        self.root.option_add('*TCombobox*Listbox.foreground', current_colors["combobox_fg"])
+        self.root.option_add('*TCombobox*Listbox.selectBackground', current_colors["add_button_bg"])
+        self.root.option_add('*TCombobox*Listbox.selectForeground', current_colors["add_button_fg"])
+
+        for ft_window in self.all_ftools:
+            try:
+                if ft_window.frame.winfo_exists():
+                    ft_window.apply_theme()
+            except:
+                pass
+
+        for sb in self.all_shortcut_buttons:
+            sb.apply_theme(self)
+            
+        if shortcuts_window:
+            for widget in shortcuts_window.winfo_children():
+                if isinstance(widget, ttk.Frame):
+                    widget.config(style=f"{self.current_theme}.TFrame")
+
+    def toggle_theme(self):
+        debug_log(f"Toggling theme from {self.current_theme} to {'dark' if self.current_theme == 'light' else 'light'}")
+        self.current_theme = "dark" if self.current_theme == "light" else "light"
+        self.apply_theme_to_all_widgets()
+        self.save_global_config()
+
+# --- Main Application Functions ---
+def create_new_shortcut_button(style_manager):
+    """Creates a new shortcut button"""
+    # Ensure the shortcuts window is open
+    global shortcuts_window, shortcuts_inner_frame
+    if shortcuts_window is None or not shortcuts_window.winfo_exists():
+        toggle_shortcuts_window()
+    else:
+        # Bring to front if already exists
+        shortcuts_window.deiconify()
+
+    # Now create the shortcut
+    dialog = ShortcutConfigDialog(root_main_app, style_manager)
+    if dialog.result:
+        global next_shortcut_unique_id
+        new_id = next_shortcut_unique_id
+        config_data = dialog.result
+        config_data["id"] = new_id
+        sb = ShortcutButton(shortcuts_inner_frame, style_manager, new_id, config_data)
+        all_shortcut_buttons.append(sb)
+        next_shortcut_unique_id += 1
+        reposition_shortcut_buttons()
+        save_shortcut_config()
+        shortcut_log(f"Created new shortcut: {sb.config['name']} (ID: {new_id})")
+
+def toggle_shortcuts_window():
+    """Toggles visibility of shortcuts window"""
+    global shortcuts_window, shortcuts_canvas, shortcuts_inner_frame, shortcuts_loaded
+    
+    if shortcuts_window and shortcuts_window.winfo_exists():
+        if shortcuts_window.state() == "normal":
+            # Save geometry before hiding
+            style_manager_ref.save_global_config(shortcuts_geometry=shortcuts_window.geometry())
+            shortcuts_window.withdraw()
+            debug_log("Hiding shortcuts window")
+        else:
+            shortcuts_window.deiconify()
+            debug_log("Showing shortcuts window")
+    else:
+        # Create new shortcuts window
+        shortcuts_window = tk.Toplevel(root_main_app)
+        shortcuts_window.title("MoonFlyff FTool - Shortcuts")
+        shortcuts_window.protocol("WM_DELETE_WINDOW", lambda: shortcuts_window.withdraw())
+        
+        # Apply saved geometry if available
+        if style_manager_ref.shortcuts_geometry:
+            shortcuts_window.geometry(style_manager_ref.shortcuts_geometry)
+        else:
+            shortcuts_window.geometry("400x500")
+        
+        # Create canvas and scrollbar
+        shortcuts_canvas = tk.Canvas(shortcuts_window, bg=style_manager_ref.get_current_color("bg"), 
+                                    highlightbackground=style_manager_ref.get_current_color("bg"))
+        shortcuts_canvas.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        
+        scrollbar = ttk.Scrollbar(shortcuts_window, orient="vertical", command=shortcuts_canvas.yview, 
+                                 style="Vertical.TScrollbar")
+        scrollbar.pack(side="right", fill="y")
+        shortcuts_canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Create inner frame for buttons
+        shortcuts_inner_frame = ttk.Frame(shortcuts_canvas, style="TFrame")
+        shortcuts_canvas.create_window((0, 0), window=shortcuts_inner_frame, anchor="nw")
+        
+        # Configure canvas scrolling
+        shortcuts_inner_frame.bind("<Configure>", lambda e: shortcuts_canvas.configure(scrollregion=shortcuts_canvas.bbox("all")))
+        shortcuts_canvas.bind("<Configure>", lambda e: shortcuts_canvas.itemconfig(1, width=e.width))
+        
+        # Load shortcuts if not already loaded
+        if not shortcuts_loaded:
+            load_shortcut_config(shortcuts_inner_frame)
+        else:
+            # If already loaded, reposition existing buttons
+            reposition_shortcut_buttons()
+        
+        debug_log("Created shortcuts window")
+
+# --- Main Application ---
+root_main_app = None
+
+def main():
+    global root_main_app, style_manager_ref
+    root_main_app = tk.Tk()
+    root_main_app.title("MoonFlyff FTool")
+    root_main_app.geometry("1200x800")
+    debug_log("Application started")
+
+    style_manager_ref = ThemeManager(root_main_app, all_ftools, all_shortcut_buttons)
+
+    if style_manager_ref.window_geometry:
+        root_main_app.geometry(style_manager_ref.window_geometry)
+
+    # Top controls
+    top_controls_frame = ttk.Frame(root_main_app, style="TFrame")
+    top_controls_frame.pack(side="top", fill="x", padx=10, pady=5)
+
+    add_button = ttk.Button(top_controls_frame, text="+", command=lambda: add_ftool_window(style_manager_ref), style="Add.TButton")
+    add_button.pack(side="left", padx=5)
+
+    create_shortcut_button = ttk.Button(top_controls_frame, text="Create New Shortcut", command=lambda: create_new_shortcut_button(style_manager_ref), style="Add.TButton")
+    create_shortcut_button.pack(side="left", padx=5)
+
+    toggle_shortcuts_button = ttk.Button(top_controls_frame, text="Toggle Shortcuts", command=toggle_shortcuts_window, style="Themed.TButton")
+    toggle_shortcuts_button.pack(side="left", padx=5)
+
+    global refresh_all_button
+    refresh_all_button = ttk.Button(top_controls_frame, text="Refresh Flyff Windows", command=refresh_all_ftool_windows, style="Themed.TButton")
+    refresh_all_button.pack(side="left", padx=5)
+    style_manager_ref.set_refresh_button(refresh_all_button)
+
+    global theme_button
+    theme_button = ttk.Button(top_controls_frame, text="", command=style_manager_ref.toggle_theme, style="Themed.TButton")
+    theme_button.pack(side="right", padx=5)
+    style_manager_ref.set_theme_button(theme_button)
+
+    # Main canvas and scrollbar
+    global main_canvas, app_frame
+    main_canvas = tk.Canvas(root_main_app, bg=COLORS[style_manager_ref.current_theme]["bg"], highlightbackground=COLORS[style_manager_ref.current_theme]["bg"])
+    main_canvas.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+
+    scrollbar = ttk.Scrollbar(root_main_app, orient="vertical", command=main_canvas.yview, style="Vertical.TScrollbar")
+    scrollbar.pack(side="right", fill="y")
+    main_canvas.configure(yscrollcommand=scrollbar.set)
+    main_canvas.bind('<Configure>', on_canvas_configure)
+    main_canvas.bind_all("<MouseWheel>", lambda event: main_canvas.yview_scroll(int(-1*(event.delta/120)), "units"))
+
+    app_frame = ttk.Frame(main_canvas, style="TFrame")
+    main_canvas.create_window((0, 0), window=app_frame, anchor="nw")
+
+    # Load existing window configurations
+    config_files = [f for f in os.listdir('.') if f.startswith('ftool_config_win_id') and f.endswith('.json')]
+    if config_files:
+        existing_ids = []
+        for f_name in config_files:
+            try:
+                unique_id = int(f_name.replace("ftool_config_win_id", "").replace(".json", ""))
+                existing_ids.append(unique_id)
+            except ValueError:
+                continue
+
+        existing_ids.sort()
+        for unique_id in existing_ids:
+            ftool_instance = FToolWindow(app_frame, unique_id, style_manager_ref)
+            all_ftools.append(ftool_instance)
+            debug_log(f"Loaded FTool window ID: {unique_id}")
+
+        if existing_ids:
+            global next_window_unique_id
+            next_window_unique_id = max(existing_ids) + 1
+            debug_log(f"Next window ID: {next_window_unique_id}")
+
+        reposition_all_ftool_windows()
+    else:
+        add_ftool_window(style_manager_ref)
+        debug_log("Created initial FTool window")
+
+    style_manager_ref.apply_theme_to_all_widgets()
+    start_keyboard_listener()
+
+    root_main_app.protocol("WM_DELETE_WINDOW", lambda: on_closing(root_main_app, style_manager_ref))
+    root_main_app.mainloop()
+
+if __name__ == "__main__":
+    main()
