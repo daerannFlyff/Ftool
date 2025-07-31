@@ -8,8 +8,8 @@ Bug
 Bug d'affichage en mode sombre : Si vous constatez un contour blanc autour des éléments ronds lorsque vous utilisez le mode sombre, il vous suffit de redémarrer l'application pour corriger ce bug visuel.(En restant dans le mode sombre)
 
 Astuce d'Utilisation
-Organisation du bureau : Pour réduire l'encombrement de votre bureau, nous vous recommandons de placer le dossier entier de Ftool à l'intérieur de votre répertoire MoonFlyffClient. Vous pourrez ensuite créer un raccourci de l'exécutable "Ftool by Daerann-Druckertyp" (qui se trouve dans le dossier Ftool par Daerann-Druckertyp) directement sur votre bureau pour un accès facile
-
+Organisation du bureau :Pour réduire l'encombrement de votre bureau, nous vous recommandons de placer le dossier entier de Ftool à l'intérieur de votre répertoire MoonFlyffClient. Vous pourrez ensuite créer un raccourci de l'exécutable "Ftool by Daerann-Druckertyp" (qui se trouve dans le dossier Ftool) directement sur votre bureau pour un accès facile
+Vous pouvez reconfigurez / supprimez les shortcut en faisant un clicl droit
 Merci chat gpt pour le texte
 
 
